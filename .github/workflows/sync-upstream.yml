@@ -1,0 +1,173 @@
+name: 同步上游
+
+# ★ 目的：上游 xiaoyang111222/cn-math-taxonomy 是知识图谱的源头，
+#   我们 fork 过来只是为了加一套自己的账号系统（gd-account/）。
+#   上游持续更新，手工跟不动，所以自动跑。
+#
+# ★★ 核心约束（这是本文件存在的理由）：
+#     上游更新后**先跑测试**，测试不过就**不更新 main**，只提 issue 说明。
+#   宁可停在旧版，也不能让一个跑不起来的版本顶掉能用的版本 ——
+#   停旧版最坏是落后，推坏版是站点直接开天窗。
+
+on:
+  schedule:
+    # 每天 UTC 18:00（北京时间凌晨 2 点），那时上游多半已收工
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制同步（跳过"无更新则退出"的短路）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 装 node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 取上游
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/xiaoyang111222/cn-math-taxonomy.git || true
+          git fetch upstream main --depth=1
+
+      - name: 判断有无更新
+        id: check
+        run: |
+          UP=$(git rev-parse upstream/main)
+          ME=$(git rev-parse HEAD)
+          echo "upstream=$UP" >> $GITHUB_OUTPUT
+          echo "mine=$ME" >> $GITHUB_OUTPUT
+          # 上游的 tip 已经是我们历史的一部分 → 没有新东西
+          if git merge-base --is-ancestor "$UP" HEAD && [ "${{ inputs.force }}" != "true" ]; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "上游无更新（$UP 已在历史中），退出"
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "发现上游更新：$ME -> $UP"
+          fi
+
+      - name: 合并上游
+        if: steps.check.outputs.changed == 'true'
+        id: merge
+        run: |
+          # -X ours：只在我们和上游**都改过同一个文件**时才偏向我们。
+          # gd-account/ 是上游没有的目录，不会被影响，照样留着；
+          # 上游更新过的文件正常被覆盖 —— 这正是我们要的。
+          if git merge upstream/main --no-edit -X ours; then
+            echo "ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "ok=false" >> $GITHUB_OUTPUT
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt || true
+            echo "合并冲突，以下文件需要人工处理："
+            cat /tmp/conflicts.txt
+          fi
+
+      - name: 重新注入账号系统
+        if: steps.check.outputs.changed == 'true' && steps.merge.outputs.ok == 'true'
+        run: |
+          # ★ 关键一步：上游改过 index.html 的话，我们那两行 <script>
+          #   在 merge 时就丢了。这里补回来，幂等。
+          python3 gd-account/inject.py inject
+
+      - name: 跑测试
+        if: steps.check.outputs.changed == 'true' && steps.merge.outputs.ok == 'true'
+        id: test
+        run: |
+          set -o pipefail
+          ok=0
+
+          echo "=== 1/3 上游引擎测试（89 项基线）==="
+          node tests/test_engine.js 2>&1 | tee /tmp/t1.log
+          [ "${PIPESTATUS[0]}" -ne 0 ] && ok=1
+          tail -1 /tmp/t1.log
+
+          echo ""
+          echo "=== 2/3 账号系统语法 ==="
+          for f in gd-account/*.js; do
+            node --check "$f" || ok=1
+            echo "  ✓ $f"
+          done
+
+          echo ""
+          echo "=== 3/3 注入完整性（这一项最容易静默失效）==="
+          python3 - <<'PY'
+          import sys, os
+          bad = 0
+          for p in ['index.html', 'diagnose/index.html', 'explore/index.html']:
+              if not os.path.isfile(p):
+                  continue
+              s = open(p, encoding='utf-8', errors='ignore').read()
+              if 'gd-account/gd-account.js' in s:
+                  print('  ✓ %s 已注入' % p)
+              else:
+                  print('  ✗ %s 缺失注入' % p); bad = 1
+          sys.exit(bad)
+          PY
+          [ $? -ne 0 ] && ok=1
+
+          echo ""
+          echo "ok=$ok" >> $GITHUB_OUTPUT
+          exit $ok
+
+      - name: 发布（仅测试通过）
+        if: steps.check.outputs.changed == 'true' && steps.merge.outputs.ok == 'true' && steps.test.outputs.ok == '0'
+        run: |
+          git add -A
+          git commit -m "chore: 同步上游至 ${{ steps.check.outputs.upstream }}" || echo "无改动"
+          git push origin HEAD:main
+
+      - name: 测试失败 → 不更新，只报告
+        if: failure() && steps.check.outputs.changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let log = '';
+            try { log = fs.readFileSync('/tmp/t1.log', 'utf8'); } catch (e) { log = '(无测试日志)'; }
+            // 只取失败行，issue 里塞几千行没人看
+            const fails = log.split('\n').filter(l => /FAIL|Error|错误/.test(l)).slice(0, 25).join('\n');
+            let conflicts = '';
+            try { conflicts = fs.readFileSync('/tmp/conflicts.txt', 'utf8'); } catch (e) {}
+            const up = '${{ steps.check.outputs.upstream }}';
+            const title = `⚠️ 上游 ${up.substring(0,7)} 同步被拦下（未更新）`;
+            const body = [
+              '自动同步检测到上游有新提交，但**测试未通过**，因此**没有更新 main**。',
+              '',
+              '当前线上仍是可用的旧版本 —— 这是有意为之。',
+              '',
+              '## 上游 commit',
+              `\`${up}\``,
+              '',
+              '## 失败信息',
+              '```',
+              fails || '(未能提取到失败行，请查看 Actions 日志)',
+              '```',
+              conflicts ? '\n## 合并冲突文件\n```\n' + conflicts + '\n```' : '',
+              '',
+              '## 怎么处理',
+              '1. 看 Actions 日志确认是新上游引入的问题，还是我们的适配要改',
+              '2. 若是上游数据/引擎问题：等上游修，或直接在上游提 issue',
+              '3. 若是我们的 gd-account 适配要改：改完手动跑一次本 workflow',
+            ].filter(Boolean).join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title, body,
+              labels: ['upstream-sync']
+            });
